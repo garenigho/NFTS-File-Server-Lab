@@ -1,3 +1,5 @@
+[![Watch the Architecture Walkthrough on Loom](https://img.shields.io/badge/Watch%20Walkthrough-Loom-2496ED?style=for-the-badge&logo=loom&logoColor=white)]([https://www.loom.com/share/YOUR_LOOM_VIDEO_ID_HERE](https://www.loom.com/share/27805db53e8041b292a6fe63ac61405e))
+
 # Lab 1 — NTFS File Server Lab
 
 **Active Directory · NTFS Permissions · SMB File Services · Group Policy · Terraform · PowerShell**
