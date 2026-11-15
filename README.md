@@ -1,4 +1,4 @@
-[![Watch the Architecture Walkthrough on Loom](https://img.shields.io/badge/Watch%20Walkthrough-Loom-2496ED?style=for-the-badge&logo=loom&logoColor=white)]([https://www.loom.com/share/YOUR_LOOM_VIDEO_ID_HERE](https://www.loom.com/share/27805db53e8041b292a6fe63ac61405e))
+[![Watch the Architecture Walkthrough on Loom](https://img.shields.io/badge/Watch%20Walkthrough-Loom-2496ED?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/27805db53e8041b292a6fe63ac61405e)
 
 # Lab 1 — NTFS File Server Lab
 
@@ -10,8 +10,10 @@ Deploys a fully automated, three-tier Windows file server environment on Azure u
 |---|---|
 | **Domain** | `lab.local` — Region: Central US |
 | **VMs** | `DC01` (Domain Controller) · `FS01` (File Server) · `CLIENT01` (Windows 11 Workstation) |
-| **Deploy time** | 10–15 min (Terraform) + 15–20 min (`configure-lab.ps1`) |
-| **Est. cost** | ~$0.15–$0.25/hr while all three VMs are running |
+| **VM size** | `Standard_D2s_v6` (see [Troubleshooting](#troubleshooting) if your subscription has no quota for it) |
+| **Images** | Windows Server 2022 Azure Edition · Windows 11 Pro `win11-25h2-pro` |
+| **Deploy time** | 10–15 min (Terraform) + 15–25 min (`configure-lab.ps1`) |
+| **Est. cost** | ~$0.60/hr while all three VMs are running (estimate, varies by size and region). Deallocated VMs cost only a few cents per day for disks and static IPs |
 | **Tooling** | Terraform, Azure CLI, PowerShell, Azure Key Vault |
 | **Part of** | 3-lab series — see [Lab Series](#lab-series) below |
 
@@ -41,10 +43,10 @@ This is Lab 1 of a 3-part Azure infrastructure series. Understanding the relatio
 | Lab | Deploys | Relationship |
 |---|---|---|
 | **Lab 1 — NTFS File Server** *(this repo)* | `DC01`, `FS01`, `CLIENT01`, VNet, NSG, Key Vault in `RG-FileServerLab` | Standalone — builds all infrastructure from scratch |
-| **Lab 2 — Azure RBAC** | 3 role assignments on `FS01` only, no new VMs | Depends on Lab 1 — reads Lab 1 resources via data sources, reuses Lab 1's storage account |
+| **[Lab 2 — Azure RBAC](https://github.com/garenigho/Azure-RBAC-Access-Control)** | 3 role assignments on `FS01` only, no new VMs | Depends on Lab 1 — reads Lab 1 resources via data sources, reuses Lab 1's storage account |
 | **AUM Lab — Azure Update Manager** | `DC01`, `WS01`, `WS02`, VNet, Key Vault in `rg-aumlab` | Standalone — fully independent |
 
-> **Moving on to Lab 2?** Stop the VMs instead of destroying — Lab 2 requires `FS01` to already exist, and stopped VMs incur no compute charges. See [Pause or Tear Down](#pause-or-tear-down).
+> **Moving on to Lab 2?** Deallocate the VMs instead of destroying — Lab 2 requires `RG-FileServerLab` and `FS01` to already exist, and deallocated VMs incur no compute charges. See [Pause or Tear Down](#pause-or-tear-down).
 
 ---
 
@@ -76,6 +78,7 @@ This lab walks through the complete workflow a systems administrator follows to 
 | Deploy infrastructure with Terraform | IaC makes environments reproducible, version-controlled, and auditable |
 | Store secrets in Azure Key Vault | Hard-coded passwords are a security failure; Key Vault is the correct pattern — retrieved at runtime, never written to disk |
 | Automate with `az vm run-command` | Production Azure environments often block direct RDP/WinRM; the VM agent channel is how real automation reaches locked-down VMs |
+| Troubleshoot real deployment failures | Retired images, VM quota limits, and IP allocation races are everyday cloud problems — see [Troubleshooting](#troubleshooting) |
 
 ---
 
@@ -131,12 +134,13 @@ flowchart TB
 | Resource Group (`RG-FileServerLab`) | Single container so `az group delete` cleans up everything; Lab 2 references this name directly |
 | VNet (`10.0.0.0/16`) | Private network — VMs communicate over private IPs with no internet hop |
 | Subnet (`10.0.1.0/24`) | 251 usable addresses for the three VMs |
-| NSG — Allow RDP from admin IP only | Restricts inbound 3389 to one IP; all other inbound traffic implicitly denied |
+| NSG — Allow RDP from admin IP only | Restricts inbound 3389 to one IPv4 address (`/32`); all other inbound traffic implicitly denied |
 | Static IP on DC01 (`10.0.1.4`) | FS01/CLIENT01 point DNS here to resolve `lab.local` — must never change across restarts |
+| `depends_on` DC01's NIC (on FS01 and CLIENT01 NICs) | Terraform builds NICs in parallel; without this, a dynamic NIC can grab `10.0.1.4` before DC01's static assignment, causing `PrivateIPAddressIsAllocated` |
 | Public IPs on all VMs | Enables RDP verification from your local machine |
 | Azure Key Vault (RBAC model) | Encrypted secret storage — the admin password never touches a file, CLI arg, or terminal history |
 | `random_id` suffix on Key Vault name | Guarantees global uniqueness across all of Azure |
-| `time_sleep` resources in `main.tf` | Absorbs Azure control-plane replication delay after VNet/NSG creation |
+| `time_sleep` resources in `main.tf` and `keyvault.tf` | Absorbs Azure control-plane replication delay after VNet/NSG creation and after the Key Vault role assignment, avoiding transient errors and 403s |
 | CustomScriptExtension on CLIENT01 | Enables RDP at the OS level — Windows 11 ships with it disabled |
 | `az vm run-command` in `configure-lab.ps1` | Executes configuration scripts through the Azure VM agent, bypassing the NSG's port restrictions entirely |
 
@@ -171,59 +175,79 @@ ntfs-lab-terraform/
 
 ## Prerequisites
 
-```bash
+Run these in **PowerShell** (not Command Prompt — the `--query` quoting breaks in `cmd`).
+
+```powershell
 terraform -version   # >= 1.5.0
-az version            # Any recent Azure CLI
-powershell -version   # 5.1+ (built into Windows)
+az version           # Any recent Azure CLI
 
 # Confirm the correct Azure subscription is active
 az account show
 # If wrong: az account set --subscription "<name or ID>"
+
+# Allow local scripts for this terminal session only
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 ```
+
+**Check VM quota before deploying.** New subscriptions often have zero quota for some VM families, which fails `terraform apply` partway through:
+
+```powershell
+az vm list-usage --location centralus -o table
+```
+
+Pick a 2-vCPU size from a family that shows a limit of 6 or more, and set it in `terraform.tfvars` (`server_vm_size` and `client_vm_size`). See [Troubleshooting](#troubleshooting).
 
 ---
 
 ## Deployment Guide
 
-> Full file contents, inline rationale for every design decision, and copy-paste-ready commands live in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). Summary below.
-
 1. **Project setup** — create `ntfs-lab-terraform/` with a `scripts/` subfolder.
 2. **Terraform files** — add `backend.tf`, `versions.tf`, `variables.tf`, `main.tf`, `keyvault.tf`, `outputs.tf`, `terraform.tfvars.example`, `.gitignore`.
 3. **One-time remote state setup:**
-   ```bash
+   ```powershell
    az group create --name RG-TerraformState --location "Central US"
-   az storage account create --name tfstatentfslab --resource-group RG-TerraformState \
-     --sku Standard_LRS --encryption-services blob
-   az storage container create --name tfstate --account-name tfstatentfslab
+
+   # Storage account names must be globally unique, lowercase letters and numbers only
+   $sa = "tfstatentfs" + (Get-Random -Minimum 10000 -Maximum 99999)
+   $sa   # write this name down
+
+   az storage account create --name $sa --resource-group RG-TerraformState `
+     --location "Central US" --sku Standard_LRS --encryption-services blob
+   az storage container create --name tfstate --account-name $sa --auth-mode login
    ```
    Then update `backend.tf` with your storage account name **before** running `terraform init`.
 4. **Configure variables:**
    ```powershell
    Copy-Item terraform.tfvars.example terraform.tfvars
-   # Set rdp_source to your IP (whatismyip.com) in terraform.tfvars
+   # In terraform.tfvars, set rdp_source to your IPv4 address in /32 format.
+   # Get it with: Invoke-RestMethod https://api.ipify.org
+   # Terraform reads terraform.tfvars only — not the .example file.
+
    $env:TF_VAR_admin_password = "YourStrongPassword!"
+   # 12+ characters; avoid $, backticks, and quotes
    ```
 5. **Deploy infrastructure:**
-   ```bash
+   ```powershell
    az login
    terraform init
-   terraform plan     # expect 12–15 resources, including 3 VMs
-   terraform apply     # ~10-15 minutes
+   terraform plan     # expect about 24 resources, including 3 VMs
+   terraform apply    # ~10-15 minutes
    terraform output key_vault_name   # copy this for the next step
    ```
 6. **Add the PowerShell scripts** listed in [Repository Structure](#repository-structure) to `scripts/`.
 7. **Run the fully unattended configuration:**
    ```powershell
    .\configure-lab.ps1 -KeyVaultName "kv-fslab-XXXXXXXX"
-   # 15-20 minutes: promotes DC01, creates AD objects, domain-joins FS01/CLIENT01,
+   # 15-25 minutes: promotes DC01, creates AD objects, domain-joins FS01/CLIENT01,
    # configures shares + NTFS, sets up RDP GPO, runs verification
    ```
+   The script ends with `LAB FULLY CONFIGURED`. If it fails partway, do **not** rerun it from the top — see [Troubleshooting](#troubleshooting).
 
 ---
 
 ## Verification
 
-RDP into `CLIENT01` using the public IP from `terraform output`. All test users share the password `P@ssw0rd123!`.
+RDP into `CLIENT01` using the public IP from `terraform output`. Enter the username as `LAB\sarah.jones` (use **Show Options** in the Remote Desktop client if the username box is locked). All test users share the password `P@ssw0rd123!`.
 
 | Log in as | Share | Expected | Why |
 |---|---|---|---|
@@ -234,23 +258,39 @@ RDP into `CLIENT01` using the public IP from `terraform output`. All test users 
 | `LAB\john.smith` | `\\FS01\IT` | ✅ Full Control | Member of `GRP_IT` — Full Control NTFS |
 | `LAB\tom.davis` | `\\FS01\Finance` | ❌ Access Denied | `GRP_Sales` has no entry on Finance |
 
-`configure-lab.ps1` also runs `05-verify-ad.ps1` and `05-verify-shares.ps1` automatically at the end of the run, producing a `[PASS]`/`[FAIL]` report for every AD object and NTFS ACL without needing to log into any VM.
+**Tip:** open shares with **Windows key + R**, then type the path (for example `\\FS01\Finance`). Typing a path into the File Explorer search box returns "No items match your search" instead of opening the share. An empty share is normal.
+
+**What was verified in this deployment:** logged in as `LAB\sarah.jones`, opened and wrote to `\\FS01\Finance`, and received "You do not have permission to access" on `\\FS01\HR`. `configure-lab.ps1` also runs `05-verify-ad.ps1` and `05-verify-shares.ps1` automatically at the end of the run, producing a `[PASS]`/`[FAIL]` report for every AD object and NTFS ACL without needing to log into any VM.
 
 ---
 
 ## Pause or Tear Down
 
-**Continuing to Lab 2?** Stop the VMs — do not destroy. Lab 2 requires `RG-FileServerLab` and `FS01` to still exist, and stopped VMs incur no compute charges.
+**Continuing to Lab 2?** Deallocate the VMs — do not destroy. Lab 2 requires `RG-FileServerLab` and `FS01` to still exist, and deallocated VMs incur no compute charges (only a few cents a day for disks and static IPs).
 
-```bash
-# Pause
-az vm stop --ids $(az vm list -g RG-FileServerLab --query "[].id" -o tsv) --no-wait
+```powershell
+# Pause — use deallocate, not stop. A stopped-but-allocated VM keeps billing.
+az vm deallocate --ids (az vm list -g RG-FileServerLab --query "[].id" -o tsv) --no-wait
 
-# Resume before Lab 2
-az vm start --ids $(az vm list -g RG-FileServerLab --query "[].id" -o tsv) --no-wait
+# Confirm — all three should say "VM deallocated"
+az vm list -g RG-FileServerLab -d --query "[].{name:name,status:powerState}" -o table
 
-# Full teardown — only when completely done with the series
+# Resume
+az vm start --ids (az vm list -g RG-FileServerLab --query "[].id" -o tsv) --no-wait
+```
+
+**Full teardown — only when completely done with the series.** If you deployed Lab 2, destroy it first so its role assignments are removed before `FS01` is deleted:
+
+```powershell
+# 1. In the Lab 2 folder
 terraform destroy
+
+# 2. In this folder (the password variable must be set, even for destroy)
+$env:TF_VAR_admin_password = "YourStrongPassword!"
+terraform destroy
+
+# 3. Remote state storage (only after both destroys succeed)
+az group delete -n RG-TerraformState --yes --no-wait
 ```
 
 ---
@@ -259,12 +299,22 @@ terraform destroy
 
 | Problem | Cause | Solution |
 |---|---|---|
-| `configure-lab.ps1` fails at Key Vault | Session expired or missing role | `az login`, retry; confirm **Key Vault Secrets User** role on the vault |
-| Domain join fails — DNS not resolving | DC01 still finishing promotion | Wait 2 minutes and re-run — `configure-lab.ps1` resumes from where it stopped |
-| Cannot RDP to VMs | Your public IP changed | `curl ifconfig.me`, update `rdp_source` in `terraform.tfvars`, run `terraform apply` |
+| `terraform apply`: `exceeding approved ... Cores quota ... Current Limit: 0` | Your subscription has no quota for that VM family in the region | Run `az vm list-usage --location centralus -o table`, pick a size from a family with quota, set `server_vm_size` / `client_vm_size` in `terraform.tfvars`, re-apply. Quota increase requests on new subscriptions are often auto-denied |
+| Size shows no restrictions in `az vm list-skus` but still fails | Available is not the same as having quota | Quota is checked separately — use `az vm list-usage` |
+| `terraform apply`: `PrivateIPAddressIsAllocated` on `dc01-nic` | A dynamic NIC took `10.0.1.4` before DC01's static assignment | The FS01 and CLIENT01 NICs must `depends_on` DC01's NIC (already in `main.tf`). If it already happened, run `terraform destroy -target="azurerm_network_interface.client01"`, then `terraform apply` |
+| `terraform apply`: Windows 11 image not found | Marketplace SKUs get retired | List current SKUs: `az vm image list-skus --location centralus --publisher MicrosoftWindowsDesktop --offer windows-11 --query "[].name" -o tsv` and update `sku` in `main.tf` |
+| Changed `terraform.tfvars.example` but nothing changed | Terraform only reads `terraform.tfvars` | Copy the example to `terraform.tfvars` and edit that file. Without it, defaults apply, including `rdp_source = "*"` (RDP open to the internet) |
+| `rdp_source` rejected or RDP times out | IPv6 address used, or IP changed | Use your IPv4 address with `/32` (`Invoke-RestMethod https://api.ipify.org`), update `terraform.tfvars`, run `terraform apply` |
+| `az` command fails with `].name was unexpected at this time` | Running in Command Prompt, not PowerShell | Open a PowerShell terminal (prompt starts with `PS`) |
+| `running scripts is disabled on this system` | PowerShell execution policy | `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force` |
+| `configure-lab.ps1` fails at Key Vault | Session expired or role not yet propagated | `az login`, retry. Terraform grants the deploying identity **Key Vault Secrets Officer** on the vault |
+| `configure-lab.ps1` fails partway | A step errored after earlier steps succeeded | **Do not rerun from the top** — it would try to re-promote DC01 and recreate existing users. Fix the cause, then run only the remaining steps' scripts via `az vm run-command` |
+| Domain join fails — DNS not resolving | DC01 still finishing promotion | Wait 2 minutes, then rerun only the domain-join step for that VM |
+| `az login` fails with `AADSTS50076` (MFA required) | Tenant security defaults require MFA for a fresh session | `az login --tenant <your-tenant-id>` and approve MFA |
+| Cannot RDP to VMs | Your public IP changed, or VMs are deallocated | Check VM power state; rerun the IP lookup, update `rdp_source`, `terraform apply` |
 | Unexpected "Access Denied" | User not in the expected group | In the RDP session run `whoami /groups` to confirm group membership |
 | GPO not applying | Policy cache not refreshed | Run `gpupdate /force`, then `gpresult /r` inside the VM |
-| `terraform init` fails | `backend.tf` not updated | Confirm the storage account name in `backend.tf` matches the one created in Step 3, and the `tfstate` container exists |
+| `terraform init` fails | `backend.tf` not updated | Confirm the storage account name in `backend.tf` matches the one you created and the `tfstate` container exists |
 
 ---
 
